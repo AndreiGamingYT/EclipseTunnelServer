@@ -33,7 +33,7 @@ wss.on('connection', (ws, req) => {
     }
 });
 
-const PORT = process.env.PORT || 8080;
+const PORT = process.env.PORT || 4000;
 server.listen(PORT, () => {
     console.log(`Serverul WebSocket rulează pe portul ${PORT}`);
 });
@@ -179,4 +179,5 @@ function closeGuestConnection(hostId, guestId) {
             guestWsToHostId.delete(guestWs);
         }
     }
+
 }
