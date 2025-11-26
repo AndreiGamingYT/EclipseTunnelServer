@@ -50,33 +50,42 @@ function handleHttpRequest(req, res) {
     });
 
     req.on('end', () => {
+        // Aici se formează header-ul, corpul și httpBuffer (Cererea HTTP Brute)
         const bodyBuffer = Buffer.concat(requestBodyChunks);
         const httpBuffer = Buffer.concat([headerBuffer, bodyBuffer]);
-
-        // C. Trimiterea Mesajului NEW_GUEST (pentru a deschide un socket pe Host)
+    
+        // B. Simularea Conexiunii Guest (Clientului)
+        const shortGuestId = Math.random().toString(16).substring(2, 8); 
+        
+        // ATENȚIE: GENERĂM AICI CHEIA COMPLETĂ (12 CARACTERE)
+        const tempHeader = Buffer.alloc(HEADER_SIZE);
+        tempHeader.write(shortGuestId, 1, 6, 'hex'); // Scrie ID-ul scurt în Buffer (3 bytes)
+        const mapKey = tempHeader.toString('hex', 1, 7); // Citește ID-ul complet de 6 bytes (12 caractere hex)
+    
+        // C. Trimiterea Mesajului NEW_GUEST 
         const newGuestHeader = Buffer.alloc(HEADER_SIZE);
         newGuestHeader.writeUInt8(MSG_TYPE_NEW_GUEST, 0);
-        newGuestHeader.write(guestId, 1, 6, 'hex');
-
+        newGuestHeader.write(shortGuestId, 1, 6, 'hex'); 
+    
         if (hostWs.readyState === WebSocket.OPEN) {
             hostWs.send(newGuestHeader);
         }
-
-        // D. Trimiterea Pachetului de DATE (Cererea HTTP completă)
+    
+        // D. Trimiterea Pachetului de DATE 
         const dataHeader = Buffer.alloc(HEADER_SIZE);
         dataHeader.writeUInt8(MSG_TYPE_DATA, 0);
-        dataHeader.write(guestId, 1, 6, 'hex');
-
+        dataHeader.write(shortGuestId, 1, 6, 'hex'); 
+    
         const message = Buffer.concat([dataHeader, httpBuffer]);
         if (hostWs.readyState === WebSocket.OPEN) {
             hostWs.send(message);
-            console.log(`[PROXY ${guestId}] Am trimis Cererea HTTP (${httpBuffer.length} octeți) la Host.`);
+            console.log(`[PROXY ${shortGuestId}] Am trimis Cererea HTTP (${httpBuffer.length} octeți) la Host.`);
         }
-
+    
         // E. Așteptarea Răspunsului
-        // Stocăm obiectul 'res' (răspunsul către browser) pentru a-l închide ulterior.
+        // ACUM STOCĂM CHEIA COMPLETĂ!
         hostWs._pendingResponses = hostWs._pendingResponses || new Map();
-        hostWs._pendingResponses.set(guestId, res);
+        hostWs._pendingResponses.set(mapKey, res); // Folosim mapKey (12 caractere)
     });
     
     // Asigură-te că gestionăm timeout-ul pentru a nu bloca conexiunea
@@ -166,3 +175,4 @@ httpServer.listen(SERVER_PORT, () => {
     console.log(`Serverul Central (Render) rulează pe portul ${SERVER_PORT}`);
     console.log(`Așteaptă conexiuni WebSocket (Host) ȘI cereri HTTP (Browser).`);
 });
+
