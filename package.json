@@ -1,0 +1,15 @@
+{
+  "name": "eclipseopenworlds",
+  "version": "1.0.0",
+  "description": "Official Open Worlds Infrastructure of Eclipse Client",
+  "main": "server.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1",
+    "start": "node server.js"
+  },
+  "author": "Andreiutzuw",
+  "license": "ISC",
+  "dependencies": {
+    "express": "^5.1.0"
+  }
+}
