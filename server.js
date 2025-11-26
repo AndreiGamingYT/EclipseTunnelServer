@@ -1,178 +1,130 @@
 const WebSocket = require('ws');
 const http = require('http');
+const { URL } = require('url'); 
 
-// Configurare
-// Render va seta automat process.env.PORT, care este portul nostru public
-const SERVER_PORT = process.env.PORT || 8080; 
+// --- Configurare ---
+const SERVER_PORT = process.env.PORT || 8080;
 
-// --- Constantele Protocolului Binar ---
-const HEADER_SIZE = 7;
-const MSG_TYPE_NEW_GUEST = 0x01;
-const MSG_TYPE_DATA = 0x02;
-const MSG_TYPE_CLOSE = 0x03;
+// --- Constante Protocol Binar ---
+const MSG_TYPE_INIT_HOST = 0x00; // NOU: Pachet de Inițializare pentru Host
+const HEADER_SIZE = 7; 
+// 0x01 = NEW_GUEST, 0x02 = DATA, 0x03 = CLOSE
 
-// Harta conexiunilor Host (Host ID -> Obiect WebSocket)
 const hostWsMap = new Map();
-
-// --- 1. Funcția de Rutare a Traficului HTTP (Reverse Proxy) ---
-
-function handleHttpRequest(req, res) {
-    console.log(`[PROXY] Cerere HTTP primită: ${req.method} ${req.url}`);
-
-    // Verifică dacă un Host (tu) este conectat
-    if (hostWsMap.size === 0) {
-        res.writeHead(503, { 'Content-Type': 'text/plain' });
-        res.end('Eroare 503: Serverul țintă (Host) nu este conectat la tunel.');
-        return;
-    }
-
-    // Luăm prima (și singura) conexiune de Host
-    const [hostId, hostWs] = hostWsMap.entries().next().value;
-    const guestId = Math.random().toString(16).substring(2, 8);
-    
-    // A. Reconstruirea Headerelor HTTP (pentru a simula clientul)
-    const rawHeaders = [];
-    rawHeaders.push(`${req.method} ${req.url} HTTP/${req.httpVersion}`);
-    
-    for (const key in req.headers) {
-        // Excludem headerul 'connection' și 'upgrade' care nu sunt necesare serverului Express
-        if (key.toLowerCase() !== 'connection' && key.toLowerCase() !== 'upgrade') {
-            rawHeaders.push(`${key}: ${req.headers[key]}`);
-        }
-    }
-    const headerString = rawHeaders.join('\r\n') + '\r\n\r\n';
-    const headerBuffer = Buffer.from(headerString, 'utf8');
-
-    // B. Colectarea Corpului Cererii (Chunks)
-    const requestBodyChunks = [];
-    req.on('data', (chunk) => {
-        requestBodyChunks.push(chunk);
-    });
-
-    req.on('end', () => {
-        // Aici se formează header-ul, corpul și httpBuffer (Cererea HTTP Brute)
-        const bodyBuffer = Buffer.concat(requestBodyChunks);
-        const httpBuffer = Buffer.concat([headerBuffer, bodyBuffer]);
-    
-        // B. Simularea Conexiunii Guest (Clientului)
-        const shortGuestId = Math.random().toString(16).substring(2, 8); 
-        
-        // ATENȚIE: GENERĂM AICI CHEIA COMPLETĂ (12 CARACTERE)
-        const tempHeader = Buffer.alloc(HEADER_SIZE);
-        tempHeader.write(shortGuestId, 1, 6, 'hex'); // Scrie ID-ul scurt în Buffer (3 bytes)
-        const mapKey = tempHeader.toString('hex', 1, 7); // Citește ID-ul complet de 6 bytes (12 caractere hex)
-    
-        // C. Trimiterea Mesajului NEW_GUEST 
-        const newGuestHeader = Buffer.alloc(HEADER_SIZE);
-        newGuestHeader.writeUInt8(MSG_TYPE_NEW_GUEST, 0);
-        newGuestHeader.write(shortGuestId, 1, 6, 'hex'); 
-    
-        if (hostWs.readyState === WebSocket.OPEN) {
-            hostWs.send(newGuestHeader);
-        }
-    
-        // D. Trimiterea Pachetului de DATE 
-        const dataHeader = Buffer.alloc(HEADER_SIZE);
-        dataHeader.writeUInt8(MSG_TYPE_DATA, 0);
-        dataHeader.write(shortGuestId, 1, 6, 'hex'); 
-    
-        const message = Buffer.concat([dataHeader, httpBuffer]);
-        if (hostWs.readyState === WebSocket.OPEN) {
-            hostWs.send(message);
-            console.log(`[PROXY ${shortGuestId}] Am trimis Cererea HTTP (${httpBuffer.length} octeți) la Host.`);
-        }
-    
-        // E. Așteptarea Răspunsului
-        // ACUM STOCĂM CHEIA COMPLETĂ!
-        hostWs._pendingResponses = hostWs._pendingResponses || new Map();
-        hostWs._pendingResponses.set(mapKey, res); // Folosim mapKey (12 caractere)
-    });
-    
-    // Asigură-te că gestionăm timeout-ul pentru a nu bloca conexiunea
-    req.on('error', (err) => {
-        console.error(`[PROXY ${guestId}] Eroare la cererea HTTP: ${err.message}`);
-        res.end();
-        // Nu ștergem guestId de aici, așteptăm un CLOSE de la Host sau un alt mecanism de timeout.
-    });
-}
-
-// --- 2. Funcția de Rutare a Traficului WebSocket (Rutare Binară) ---
+const guestWsMap = new Map(); 
 
 function handleWebSocketMessage(hostWs, data) {
-    if (typeof data === 'string') {
-        console.log(`[WS] Mesaj TEXT primit de la Host: ${data}. Ignorat.`);
-        return;
-    }
-
-    if (data.length < HEADER_SIZE) {
-        console.error('[WS] Pachet prea scurt, ignorat.');
-        return;
-    }
+    if (typeof data === 'string' || data.length < HEADER_SIZE) return; 
 
     const messageType = data.readUInt8(0);
-    const guestId = data.toString('hex', 1, 7);
+    const guestId = data.toString('hex', 1, 7); 
+    const payload = data.slice(HEADER_SIZE);
+    
+    const hostId = hostWs.hostId;
 
-    // Verificăm dacă este un răspuns pentru o cerere HTTP deschisă (Reverse Proxy)
-    if (hostWs._pendingResponses && hostWs._pendingResponses.has(guestId)) {
-        const res = hostWs._pendingResponses.get(guestId);
-
-        // Extragem Buffer-ul de date (Răspunsul HTTP de la Express)
-        const httpResponseBuffer = data.slice(HEADER_SIZE);
-
-        if (messageType === MSG_TYPE_DATA) {
-            // F. Trimiterea Răspunsului înapoi la Browser
-            res.write(httpResponseBuffer);
-            console.log(`[PROXY ${guestId}] Primit ${httpResponseBuffer.length} octeți, trimiși la Browser.`);
+    if (messageType === 0x02 /* DATA */) {
+        const guestWs = guestWsMap.get(guestId); 
+        if (guestWs && guestWs.readyState === WebSocket.OPEN) {
+             guestWs.send(payload); 
         }
+    }
 
-        if (messageType === MSG_TYPE_CLOSE) {
-            // G. FINALIZAREA RĂSPUNSULUI (Rezolvă problema "loading forever")
-            res.end();
-            hostWs._pendingResponses.delete(guestId);
-            console.log(`[PROXY ${guestId}] Socket închis de Host. Răspuns HTTP finalizat.`);
+    if (messageType === 0x03 /* CLOSE */) {
+        const guestWs = guestWsMap.get(guestId); 
+        if (guestWs) {
+             guestWs.close();
+             guestWsMap.delete(guestId);
         }
-    } else {
-        console.log(`[WS] Mesaj pentru ID Guest necunoscut: ${guestId}. Ignorat.`);
     }
 }
 
-// --- 3. Inițializarea Serverului ---
-
-const httpServer = http.createServer(handleHttpRequest);
+const httpServer = http.createServer((req, res) => {
+    res.writeHead(400, { 'Content-Type': 'text/plain' });
+    res.end('Serverul Central: Acceptă doar upgrade-uri WebSocket.');
+});
 const wss = new WebSocket.Server({ noServer: true });
 
-// Ataşăm WebSocket Server la Serverul HTTP pentru evenimentul 'upgrade'
 httpServer.on('upgrade', (request, socket, head) => {
+    
     if (request.headers['upgrade'] !== 'websocket') {
         socket.end('HTTP/1.1 400 Bad Request');
         return;
     }
 
-    wss.handleUpgrade(request, socket, head, (hostWs) => {
-        const hostId = Math.random().toString(16).substring(2, 8);
-        hostWs.hostId = hostId;
-        hostWsMap.set(hostId, hostWs);
-        hostWs._pendingResponses = new Map(); // Harta pentru răspunsurile HTTP deschise
+    const url = new URL(request.url, `http://${request.headers.host}`);
+    
+    const parts = url.pathname.split('/');
+    const targetHostId = parts[2] ? parts[2].toLowerCase() : null; 
 
-        console.log(`\n[HOST ${hostId}] S-a conectat la Serverul Central. Gata de rutare.`);
+    // RUTA GUEST (/guest/:hostId)
+    if (parts[1] && parts[1].toLowerCase() === 'guest' && targetHostId) {
+        wss.handleUpgrade(request, socket, head, (guestWs) => {
+            const hostWs = hostWsMap.get(targetHostId); 
 
-        hostWs.on('message', (data) => handleWebSocketMessage(hostWs, data));
+            if (!hostWs || hostWs.readyState !== WebSocket.OPEN) {
+                guestWs.close(4067, `Host ID ${targetHostId} indisponibil.`);
+                return;
+            }
 
-        hostWs.on('close', () => {
-            console.log(`[HOST ${hostId}] Conexiunea închisă.`);
-            hostWsMap.delete(hostId);
-            // ATENȚIE: Dacă hostWs se închide, toate cererile HTTP rămase vor eșua
+            let guestId = null;
+
+            guestWs.on('message', (data) => {
+                if (typeof data === 'string' || data.length < HEADER_SIZE) return; 
+                
+                const messageType = data.readUInt8(0);
+                const currentGuestId = data.toString('hex', 1, 7); 
+
+                if (messageType === 0x01 /* NEW_GUEST */) {
+                    guestId = currentGuestId;
+                    guestWsMap.set(guestId, guestWs);
+                    
+                    if (hostWs.readyState === WebSocket.OPEN) {
+                         hostWs.send(data); 
+                    }
+                    console.log(`[SERVER] Guest ${guestId} s-a stocat pentru Host ${targetHostId}.`);
+
+                } else if (messageType === 0x02 /* DATA */) {
+                    if (hostWs.readyState === WebSocket.OPEN) {
+                         hostWs.send(data); 
+                    }
+                }
+            });
+
+            guestWs.on('close', () => {
+                if (guestId) {
+                    guestWsMap.delete(guestId);
+                }
+            });
+            
+            guestWs.on('error', (err) => { console.error(`[SERVER] Eroare Guest ${guestId}: ${err.message}`); guestWs.close(); });
         });
+        
+    } else if (url.pathname.toLowerCase() === '/host') {
+        // RUTA HOST (fără ID în URL, alocă ID dinamic)
+        wss.handleUpgrade(request, socket, head, (hostWs) => {
+            // Generare Host ID (8 caractere hex = 4 bytes)
+            const hostId = Math.random().toString(16).substring(2, 10); 
+            hostWs.hostId = hostId;
+            hostWsMap.set(hostId, hostWs); 
 
-        hostWs.on('error', (err) => {
-            console.error(`[HOST ${hostId}] Eroare WebSocket: ${err.message}`);
+            // Trimite ID-ul înapoi la Host (pachet INIT_HOST: 1 byte Type + 4 bytes ID)
+            const initMessage = Buffer.alloc(5); 
+            initMessage.writeUInt8(MSG_TYPE_INIT_HOST, 0);
+            initMessage.write(hostId, 1, 4, 'hex'); 
+            hostWs.send(initMessage);
+            
+            console.log(`\n[SERVER] Host nou conectat. I-am alocat ID: ${hostId}`);
+
+            hostWs.on('message', (data) => handleWebSocketMessage(hostWs, data));
+            hostWs.on('close', () => hostWsMap.delete(hostId));
+            hostWs.on('error', (err) => { console.error(`[SERVER] Eroare Host ${hostId}: ${err.message}`); });
         });
-    });
+    } else {
+        socket.end('HTTP/1.1 404 Not Found');
+    }
 });
 
-// Pornirea Serverului
 httpServer.listen(SERVER_PORT, () => {
-    console.log(`Serverul Central (Render) rulează pe portul ${SERVER_PORT}`);
-    console.log(`Așteaptă conexiuni WebSocket (Host) ȘI cereri HTTP (Browser).`);
+    console.log(`Eclipse Open Worlds Infrastructure \n`);
+    console.log(`Serverul Central rulează pe portul ${SERVER_PORT}`);
 });
-
