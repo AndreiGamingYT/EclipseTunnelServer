@@ -21,8 +21,43 @@ const MSG_TYPE_HTTP_RES = 0x05; // Răspuns HTTP (Host -> Server Central)
 // --- Mape de Stare ---
 const hostWsMap = new Map(); // Key: Host ID (e.g., 'b660f23e'), Value: Host WebSocket
 const guestWsMap = new Map(); // Key: Guest ID (e.g., 'a1b2c3d4e5f6'), Value: Guest WebSocket (pentru TCP)
-const httpResponseMap = new Map(); // NOU: Key: Request ID, Value: Express Response Object (pentru HTTP)
+// SCHIMBARE: Acum stocăm {res: ExpressResponse, hostId: string}
+const httpResponseMap = new Map(); // Key: Request ID, Value: {res: ExpressResponse, hostId: string} 
 let nextRequestId = 1; // NOU: Contor pentru a urmări cererile HTTP
+
+// --- Middleware CORS (pentru a permite accesul de pe web.stremio.com) ---
+app.use((req, res, next) => {
+    let hostId = null;
+
+    // Dacă URL include /u/:hostId/ îl folosim
+    const match = req.path.match(/^\/u\/([0-9a-f]+)(\/.*|$)/);
+    if (match) {
+        hostId = match[1];
+        req.url = match[2] || '/';
+    } else {
+        // Dacă nu include, alegem un host activ (poți modifica după cum vrei)
+        const hosts = Array.from(hostWsMap.keys());
+        if (hosts.length === 0) return res.status(404).send('No hosts connected');
+        hostId = hosts[0];
+    }
+
+    const hostWs = hostWsMap.get(hostId);
+    if (!hostWs || hostWs.readyState !== WebSocket.OPEN) return res.status(404).send('Host not available');
+
+    req.res = res;
+    console.log(`[PROXY] Forwarding ${req.method} ${req.originalUrl} -> Host ${hostId}${req.url}`);
+    sendHttpTunnelRequest(hostWs, req, hostId);
+});
+
+app.use(express.json());
+app.use(express.urlencoded({ extended: true }));
+app.use((req, res, next) => {
+    res.setHeader('Access-Control-Allow-Origin', '*');
+    res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
+    res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Requested-With');
+    if (req.method === 'OPTIONS') return res.sendStatus(200);
+    next();
+});
 
 // --- Funcții Helper ---
 
@@ -51,16 +86,16 @@ function sendHttpTunnelRequest(hostWs, req) {
     // 3. Mesajul final
     const message = Buffer.concat([header, Buffer.from(JSON.stringify(requestPayload), 'utf8')]);
 
-    // Salvează obiectul 'res' pentru a-i trimite răspunsul ulterior
-    httpResponseMap.set(requestId, req.res);
+    // SCHIMBARE #1: Salvează obiectul Express Response și Host ID-ul
+    httpResponseMap.set(requestId, { res: req.res, hostId: hostWs.hostId });
 
     hostWs.send(message, (err) => {
         if (err) {
             console.error(`[SERVER HTTP] Eroare la trimiterea către Host ${hostWs.hostId}: ${err.message}`);
             // Curățare și răspuns 500 imediat
-            const res = httpResponseMap.get(requestId);
-            if (res && !res.headersSent) {
-                res.status(500).send('Tunneling Error: Failed to send request to Host.');
+            const entry = httpResponseMap.get(requestId);
+            if (entry && entry.res && !entry.res.headersSent) {
+                entry.res.status(500).send('Tunneling Error: Failed to send request to Host.');
                 httpResponseMap.delete(requestId);
             }
         } else {
@@ -77,12 +112,15 @@ function handleHttpTunnelResponse(data) {
     const requestId = data.readUInt32BE(7);
     const guestId = data.toString('hex', 1, 7);
     
-    const res = httpResponseMap.get(requestId);
-    if (!res || res.headersSent) {
+    const entry = httpResponseMap.get(requestId);
+    if (!entry || entry.res.headersSent) {
         console.warn(`[SERVER HTTP] Răspuns #${requestId} (Guest: ${guestId}) primit, dar Express Response nu mai este disponibil.`);
         return;
     }
-    
+
+    const res = entry.res; // Obiectul Express Response
+    const hostId = entry.hostId; // Host ID-ul asociat
+
     // 2. Decapsulare Corp JSON
     try {
         const jsonPayload = data.slice(11).toString('utf8');
@@ -92,11 +130,25 @@ function handleHttpTunnelResponse(data) {
         if (resData.headers) {
             // Setează headerele primite de la serverul web local
             for (const key in resData.headers) {
+                const lowerKey = key.toLowerCase();
+                const value = resData.headers[key];
+
                 // Evită headerele de conexiune care nu trebuie proxy-ate (de ex. 'connection', 'keep-alive')
-                if (!['connection', 'keep-alive', 'content-length', 'transfer-encoding'].includes(key.toLowerCase())) {
-                     res.setHeader(key, resData.headers[key]);
+                if (!['connection', 'keep-alive', 'content-length', 'transfer-encoding'].includes(lowerKey)) {
+                    
+                    // SCHIMBARE #2: Modifică headerul Location dacă este o redirecționare relativă
+                    if (lowerKey === 'location' && value.startsWith('/')) {
+                        // Re-scrie calea pentru a include prefixul tunelului
+                        res.setHeader(key, `/u/${hostId}${value}`);
+                    } else {
+                        res.setHeader(key, value);
+                    }
                 }
             }
+            // Re-aplică headerele CORS pentru siguranță (deși au fost setate și în middleware)
+            res.setHeader('Access-Control-Allow-Origin', '*');
+            res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
+            res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Requested-With');
         }
 
         const body = resData.body ? Buffer.from(resData.body, 'base64') : Buffer.alloc(0);
@@ -156,26 +208,34 @@ function handleWebSocketMessage(hostWs, data) {
 function tunnelHandler(req, res) {
     const hostId = req.params.hostId;
     const hostWs = hostWsMap.get(hostId);
-    
-    // ATENȚIE: Când se folosește app.use('/u/:hostId'), 
-    // req.path conține calea *rămasă* după prefixul potrivit (ex: '/index.html').
-    // req.url trebuie să fie: req.path + query string.
-    
-    // Asigură-te că req.path este setat (ar trebui să fie garantat de app.use)
-    const path = req.path; 
-    
-    // Setează URL-ul curat care va fi trimis către Host. 
-    // req.url = calea relativă (ex: /index.html) + query string-ul original
-    req.url = path + (req._parsedUrl.search || '');
-
-    // Salvează obiectul 'res' în cerere pentru a-l accesa în 'sendHttpTunnelRequest'
-    req.res = res; 
 
     if (!hostWs || hostWs.readyState !== WebSocket.OPEN) {
         return res.status(404).send(`Host ID "${hostId}" is not currently connected.`);
     }
 
-    // Trimite cererea către Host prin WebSocket
+    // --- Construiește path-ul corect pentru host ---
+    // req.originalUrl include tot URL-ul cerut de browser (ex: /u/69210be4/api/hello?x=1)
+    // Eliminăm prefixul '/u/:hostId' din orice request
+    let path = req.originalUrl;
+
+    // Asigură-te că eliminăm exact prefixul `/u/:hostId` la început
+    const prefix = `/u/${hostId}`;
+    if (path.startsWith(prefix)) {
+        path = path.slice(prefix.length) || '/';
+    }
+
+    // Salvăm body-ul pentru request (funcționează pentru JSON și form-urlencoded)
+    // Dacă req.body este obiect, îl convertim în string
+    if (typeof req.body === 'object' && req.body !== null && !(req.body instanceof Buffer)) {
+        req.body = Buffer.from(JSON.stringify(req.body));
+    } else if (!req.body) {
+        req.body = null;
+    }
+
+    // Salvăm res pentru răspuns
+    req.res = res;
+
+    console.log(`[TUNNEL] Host ${hostId} -> Path trimis: ${path}`);
     sendHttpTunnelRequest(hostWs, req);
 }
 
@@ -185,7 +245,64 @@ function tunnelHandler(req, res) {
  * * automat toate sub-căile după /u/:hostId) și evită erorile de PathError.
  * * Ex: /u/HOSTID/ sau /u/HOSTID/cale/sub-cale
  * */
-app.use('/u/:hostId/', express.raw({ type: '*/*' }), tunnelHandler);
+// app.use('/u/:hostId/', express.raw({ type: '*/*' }), tunnelHandler);
+
+// Middleware catch-all pentru /u/:hostId/ 
+app.use('/u/:hostId/', (req, res) => {
+    const hostId = req.params.hostId;
+    const hostWs = hostWsMap.get(hostId);
+    if (!hostWs || hostWs.readyState !== WebSocket.OPEN) {
+        return res.status(404).send('Host not available');
+    }
+
+    // Citește corpul request-ului complet
+    const chunks = [];
+    req.on('data', chunk => chunks.push(chunk));
+    req.on('end', () => {
+        const bodyBuffer = Buffer.concat(chunks);
+
+        const requestPayload = {
+            method: req.method,
+            url: req.originalUrl.replace(`/u/${hostId}`, '') || '/',
+            headers: req.headers,
+            body: bodyBuffer.length ? bodyBuffer.toString('base64') : null
+        };
+
+        const guestId = Math.random().toString(16).slice(2, 14);
+        const requestId = Date.now() & 0xffffffff;
+
+        const header = Buffer.alloc(11);
+        header.writeUInt8(0x04, 0); // MSG_TYPE_HTTP_REQ
+        header.write(guestId, 1, 6, 'hex');
+        header.writeUInt32BE(requestId, 7);
+
+        const message = Buffer.concat([header, Buffer.from(JSON.stringify(requestPayload), 'utf8')]);
+
+        httpResponseMap.set(requestId, { res, hostId });
+
+        hostWs.send(message, err => {
+            if (err) {
+                console.error(`[PROXY] Error sending request to host: ${err.message}`);
+                res.status(500).send('Failed to send request to host');
+                httpResponseMap.delete(requestId);
+            }
+        });
+    });
+
+    req.on('error', (err) => {
+        console.error(`[PROXY] Request error: ${err.message}`);
+        res.status(400).send('Bad Request');
+    });
+});
+
+
+// app.use('/u/:hostId', tunnelHandler);
+
+// app.use('/u/:hostId/',
+//     express.json(),                  // parsează JSON
+//     express.urlencoded({ extended: true }), // parsează x-www-form-urlencoded
+//     tunnelHandler
+// );
 
 
 // Middleware (pentru orice altceva)
