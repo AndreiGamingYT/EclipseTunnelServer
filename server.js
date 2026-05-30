@@ -120,10 +120,10 @@ wss.on("connection", (ws) => {
           role       = "guest";
           code       = msg.code;
           sessionKey = newKey();  // assigned ONCE, reused for the lifetime of this WS connection
-          host.sessions.set(sessionKey, { guestWs: ws });
+          host.sessions.set(sessionKey, { guestWs: ws, gen: 0 });
           console.log(`[GUEST] joined code=${code} key=${sessionKey}`);
           sendCtrl(ws,      { type: "connected", sessionKey });
-          sendCtrl(host.ws, { type: "guest_joined", sessionKey });
+          sendCtrl(host.ws, { type: "guest_joined", sessionKey, gen: 0 });
 
         } else {
           ws.close(1008, "Unknown role");
@@ -157,7 +157,7 @@ wss.on("connection", (ws) => {
           // tcp_opened already arrived and we must not kill that new session.
           if (session && session.gen === msg.gen) {
             host.sessions.delete(sessionKey);
-            sendCtrl(host.ws, { type: "guest_tcp_closed", sessionKey });
+            sendCtrl(host.ws, { type: "guest_tcp_closed", sessionKey, gen: msg.gen });
           }
         }
         console.log(`[GUEST] tcp_closed code=${code} key=${sessionKey} gen=${msg.gen}`);
