@@ -140,22 +140,27 @@ wss.on("connection", (ws) => {
       if (role === "guest" && msg.type === "tcp_opened") {
         const host = hosts.get(code);
         if (!host) return;
-        host.sessions.set(sessionKey, { guestWs: ws });
-        console.log(`[GUEST] tcp_opened code=${code} key=${sessionKey}`);
-        sendCtrl(host.ws, { type: "guest_joined", sessionKey });
+        // Increment generation so any in-flight tcp_closed from the previous
+        // connection can detect it's stale and not kill this new session.
+        const gen = ((host.sessions.get(sessionKey) || {}).gen || 0) + 1;
+        host.sessions.set(sessionKey, { guestWs: ws, gen });
+        console.log(`[GUEST] tcp_opened code=${code} key=${sessionKey} gen=${gen}`);
+        sendCtrl(host.ws, { type: "guest_joined", sessionKey, gen });
         return;
       }
 
-      // Guest's MC client closed its TCP connection.
-      // Remove session from map immediately so the host stops forwarding data,
-      // then tell host to destroy its TCP socket.
       if (role === "guest" && msg.type === "tcp_closed") {
         const host = hosts.get(code);
         if (host) {
-          host.sessions.delete(sessionKey);   // drop session FIRST — kills data forwarding
-          sendCtrl(host.ws, { type: "guest_tcp_closed", sessionKey });
+          const session = host.sessions.get(sessionKey);
+          // Only act if the generation matches — if gen is higher, a new
+          // tcp_opened already arrived and we must not kill that new session.
+          if (session && session.gen === msg.gen) {
+            host.sessions.delete(sessionKey);
+            sendCtrl(host.ws, { type: "guest_tcp_closed", sessionKey });
+          }
         }
-        console.log(`[GUEST] tcp_closed code=${code} key=${sessionKey}`);
+        console.log(`[GUEST] tcp_closed code=${code} key=${sessionKey} gen=${msg.gen}`);
         return;
       }
 
